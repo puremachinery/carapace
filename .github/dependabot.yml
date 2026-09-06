@@ -41,6 +41,23 @@ updates:
           - "minor"
           - "patch"
 
+  # fuzz/ declares its own [workspace] with an independent lock file, which the
+  # entry above does not cover. Left alone it drifts: before this was added the
+  # fuzz lock still resolved wasmtime 46.0.1 while the root was on 47.0.4, and
+  # `cargo metadata --manifest-path fuzz/Cargo.toml --locked` already failed on
+  # master.
+  - package-ecosystem: "cargo"
+    directory: "/fuzz"
+    schedule:
+      interval: "daily"
+    open-pull-requests-limit: 99
+    groups:
+      fuzz-minor-patch:
+        applies-to: "version-updates"
+        update-types:
+          - "minor"
+          - "patch"
+
   - package-ecosystem: "github-actions" # See documentation for possible values
     directory: "/" # Location of package manifests
     schedule:
