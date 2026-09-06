@@ -1631,7 +1631,7 @@ impl WsServerState {
             .collect();
 
         // Sort by ts descending (newest first)
-        entries.sort_by(|a, b| b.0.cmp(&a.0));
+        entries.sort_by_key(|a| std::cmp::Reverse(a.0));
 
         // Limit to MAX_PRESENCE_ENTRIES (Node parity)
         let mut admin = Vec::new();
