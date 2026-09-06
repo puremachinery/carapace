@@ -2863,7 +2863,7 @@ impl SessionStore {
         }
 
         available.extend(locked);
-        available.sort_by(|a, b| b.updated_at.unwrap_or(0).cmp(&a.updated_at.unwrap_or(0)));
+        available.sort_by_key(|a| std::cmp::Reverse(a.updated_at.unwrap_or(0)));
 
         let offset = filter.offset.unwrap_or(0);
         let limit = filter.limit.unwrap_or(usize::MAX);
@@ -4076,7 +4076,7 @@ impl SessionStore {
         }
 
         // Sort by updated_at descending
-        result.sort_by(|a, b| b.0.updated_at.cmp(&a.0.updated_at));
+        result.sort_by_key(|a| std::cmp::Reverse(a.0.updated_at));
 
         Ok(result)
     }

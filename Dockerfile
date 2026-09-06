@@ -1,5 +1,7 @@
 # ---- Build stage ----
-FROM rust:1.94.1-slim AS builder
+# Tracks stable, matching rust-toolchain.toml. The runtime stage below floats
+# on debian:bookworm-slim the same way.
+FROM rust:slim AS builder
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
