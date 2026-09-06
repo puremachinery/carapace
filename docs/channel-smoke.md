@@ -65,7 +65,7 @@ Assumes `signal-cli-rest-api` is running and configured in `carapace.json5`
 
 Common failure indicators:
 
-- repeated HTTP errors polling `/v1/receive/{number}`
+- repeated WebSocket connect errors or stream disconnects on `/v1/receive/{number}` (confirm `signal-cli-rest-api` is running in `MODE=json-rpc-native` or `MODE=json-rpc`)
 - missing/incorrect `signal.phoneNumber`
 - signal-cli service not reachable from Carapace host
 
