@@ -2,7 +2,15 @@
 
 use serde_json::{json, Value};
 
-use super::*;
+// Import from the parent explicitly rather than glob-importing it. `ws/mod.rs`
+// re-exports names that originate here, so `use super::*` pulled them back in at
+// a second visibility and made every such name ambiguous.
+use std::sync::Arc;
+
+use super::{
+    error_shape, now_ms, ConnectionContext, ErrorShape, WsServerState, ERROR_INVALID_REQUEST,
+    ERROR_UNAVAILABLE,
+};
 
 mod channels;
 mod config;

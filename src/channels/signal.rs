@@ -295,10 +295,8 @@ fn sanitize_signal_error_json_value(value: &mut serde_json::Value, label: Option
                 *text = sanitize_signal_error_text(text);
             }
         }
-        serde_json::Value::Number(number) => {
-            if should_redact_signal_json_number(label, number) {
-                *value = serde_json::Value::String("[redacted]".to_string());
-            }
+        serde_json::Value::Number(number) if should_redact_signal_json_number(label, number) => {
+            *value = serde_json::Value::String("[redacted]".to_string());
         }
         _ => {}
     }
