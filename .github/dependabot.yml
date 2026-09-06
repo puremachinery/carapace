@@ -11,14 +11,22 @@ updates:
       interval: "daily"
     open-pull-requests-limit: 99
     groups:
-      wit-tooling:
+      # wasmtime and the wasm-tools crates ship as one upstream release train:
+      # wasmtime 48 pairs with the 0.257 wit-*/wasmparser line. Bumping them in
+      # separate PRs strands each one until the others merge, and lets the lock
+      # file accumulate several wasmparser versions at once.
+      #
+      # update-types is deliberately omitted, which means every type. These are
+      # 0.x crates, so a 0.255 -> 0.257 bump counts as major; listing the types
+      # explicitly did not group them in practice.
+      wasm-toolchain:
         applies-to: "version-updates"
         patterns:
-          - "wit-*"
-        update-types:
-          - "major"
-          - "minor"
-          - "patch"
+          - "wit-parser"
+          - "wit-component"
+          - "wasmtime"
+          - "wasmparser"
+          - "wasm-encoder"
       cargo-minor-patch:
         applies-to: "version-updates"
         update-types:
