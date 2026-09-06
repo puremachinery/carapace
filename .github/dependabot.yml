@@ -21,12 +21,20 @@ updates:
       # explicitly did not group them in practice.
       wasm-toolchain:
         applies-to: "version-updates"
+        # Covers the whole train, including crates that are transitive today,
+        # so one becoming a direct dependency does not silently fall out of the
+        # group. wasm-bindgen, wasm-streams and similar are deliberately absent:
+        # despite the prefix they are a different project on their own cadence.
         patterns:
-          - "wit-parser"
-          - "wit-component"
+          - "wit-*"
           - "wasmtime"
+          - "wasmtime-*"
           - "wasmparser"
+          - "wasmprinter"
           - "wasm-encoder"
+          - "wasm-compose"
+          - "wasm-metadata"
+          - "wast"
       cargo-minor-patch:
         applies-to: "version-updates"
         update-types:
