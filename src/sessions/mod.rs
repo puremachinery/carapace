@@ -193,15 +193,12 @@ fn is_canonical_session_id(session_hint: &str) -> bool {
 /// Empty hints are discarded. Existing canonical IDs are preserved and
 /// normalized to lowercase to avoid double hashing and key mismatches.
 pub fn canonicalize_optional_session_hint(session_hint: Option<&str>) -> Option<String> {
-    let trimmed = match session_hint {
-        Some(hint) => {
-            let hint = hint.trim();
-            if hint.is_empty() {
-                return None;
-            }
-            hint
+    let trimmed = {
+        let hint = session_hint?.trim();
+        if hint.is_empty() {
+            return None;
         }
-        None => return None,
+        hint
     };
     if is_canonical_session_id(trimmed) {
         Some(trimmed.to_ascii_lowercase())

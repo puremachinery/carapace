@@ -321,7 +321,7 @@ pub(super) fn handle_system_presence(state: &WsServerState) -> Result<Value, Err
         .collect();
 
     // Sort by ts descending (newest first)
-    entries.sort_by(|a, b| b.0.cmp(&a.0));
+    entries.sort_by_key(|a| std::cmp::Reverse(a.0));
 
     // Limit to MAX_PRESENCE_ENTRIES (Node uses 200)
     let result: Vec<Value> = entries
@@ -574,7 +574,7 @@ fn update_presence_registry(
     // Remove oldest entries when over limit
     if presence.len() > MAX_PRESENCE_ENTRIES {
         let mut entries: Vec<_> = presence.iter().map(|(k, v)| (k.clone(), v.ts)).collect();
-        entries.sort_by(|a, b| a.1.cmp(&b.1)); // Sort by ts ascending (oldest first)
+        entries.sort_by_key(|a| a.1); // Sort by ts ascending (oldest first)
         let to_remove = presence.len() - MAX_PRESENCE_ENTRIES;
         for (key, _) in entries.into_iter().take(to_remove) {
             presence.remove(&key);
@@ -606,12 +606,12 @@ pub(super) fn handle_system_event(
     // `SYSTEM_EVENT_HISTORY_MAX` (1000) history slots with frame-cap-
     // sized strings. The matching constant lives next to the history
     // size constant so future cap rotations stay co-located.
-    if text.len() > super::super::SYSTEM_EVENT_TEXT_MAX_BYTES {
+    if text.len() > crate::server::ws::SYSTEM_EVENT_TEXT_MAX_BYTES {
         return Err(error_shape(
             ERROR_INVALID_REQUEST,
             &format!(
                 "text exceeds {} byte cap",
-                super::super::SYSTEM_EVENT_TEXT_MAX_BYTES
+                crate::server::ws::SYSTEM_EVENT_TEXT_MAX_BYTES
             ),
             None,
         ));
@@ -892,14 +892,14 @@ mod tests {
     fn test_handle_system_event_rejects_oversize_text() {
         let state = WsServerState::new(WsServerConfig::default());
         let conn = make_test_conn();
-        let oversize = "x".repeat(super::super::SYSTEM_EVENT_TEXT_MAX_BYTES + 1);
+        let oversize = "x".repeat(crate::server::ws::SYSTEM_EVENT_TEXT_MAX_BYTES + 1);
         let params = json!({ "text": oversize });
         let err = handle_system_event(Some(&params), &state, &conn)
             .expect_err("oversize text must be rejected before enqueue");
         let serialized = serde_json::to_string(&err).unwrap();
         assert!(
             serialized.contains("byte cap")
-                && serialized.contains(&super::super::SYSTEM_EVENT_TEXT_MAX_BYTES.to_string()),
+                && serialized.contains(&crate::server::ws::SYSTEM_EVENT_TEXT_MAX_BYTES.to_string()),
             "rejection must name the cap; got: {serialized}"
         );
     }
@@ -915,7 +915,7 @@ mod tests {
     #[test]
     fn test_enqueue_system_event_truncates_oversize_text_at_chokepoint() {
         let state = WsServerState::new(WsServerConfig::default());
-        let huge = "x".repeat(super::super::SYSTEM_EVENT_TEXT_MAX_BYTES * 4);
+        let huge = "x".repeat(crate::server::ws::SYSTEM_EVENT_TEXT_MAX_BYTES * 4);
         state.enqueue_system_event(SystemEvent {
             ts: 1,
             text: huge,
@@ -928,7 +928,7 @@ mod tests {
         let history = state.get_system_event_history();
         let last = history.last().expect("event was enqueued");
         assert!(
-            last.text.len() <= super::super::SYSTEM_EVENT_TEXT_MAX_BYTES,
+            last.text.len() <= crate::server::ws::SYSTEM_EVENT_TEXT_MAX_BYTES,
             "chokepoint must truncate; got {} bytes",
             last.text.len()
         );
@@ -943,7 +943,7 @@ mod tests {
     fn test_handle_system_event_accepts_text_at_cap() {
         let state = WsServerState::new(WsServerConfig::default());
         let conn = make_test_conn();
-        let at_cap = "x".repeat(super::super::SYSTEM_EVENT_TEXT_MAX_BYTES);
+        let at_cap = "x".repeat(crate::server::ws::SYSTEM_EVENT_TEXT_MAX_BYTES);
         let params = json!({ "text": at_cap });
         handle_system_event(Some(&params), &state, &conn)
             .expect("text exactly at the cap must be accepted");
