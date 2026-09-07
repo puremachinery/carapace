@@ -652,7 +652,7 @@ dependencies = [
  "json5",
  "keyring",
  "libc",
- "mach2",
+ "mach2 0.7.0",
  "matrix-sdk",
  "matrix-sdk-store-encryption 0.16.1",
  "matrix-sdk-store-encryption 0.18.0",
@@ -3060,6 +3060,12 @@ name = "mach2"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dae608c151f68243f2b000364e1f7b186d9c29845f7d2d85bd31b9ad77ad552b"
+
+[[package]]
+name = "mach2"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0d28e293f2b8c9d2b2d1c0193bd3c1cbdc0d2cf396888dc01162f7cf9d6c3f3"
 
 [[package]]
 name = "macroific"
@@ -6565,7 +6571,7 @@ dependencies = [
  "ittapi",
  "libc",
  "log",
- "mach2",
+ "mach2 0.6.0",
  "memfd",
  "object",
  "once_cell",
