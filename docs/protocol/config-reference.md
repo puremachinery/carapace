@@ -387,9 +387,9 @@ These are the most commonly used provider sections for first-run setup and day-1
 Enable Carapace to listen and respond on external chat platforms.
 
 - **`signal`**
-  - *What it does:* Uses `signal-cli` REST integration.
+  - *What it does:* Connects to `signal-cli-rest-api` for outbound delivery and inbound WebSocket message reception. Requires `signal-cli-rest-api` running in JSON-RPC mode (`MODE=json-rpc-native` or `MODE=json-rpc`).
   - *Common values:*
-    - `baseUrl`: String address to the REST wrapper.
+    - `baseUrl`: String address to the REST/WebSocket service.
     - `phoneNumber`: String. Your registered number (like `"+15551234567"`).
     - `enabled`: `true` or `false`.
 - **`telegram`**
