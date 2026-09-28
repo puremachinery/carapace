@@ -11,14 +11,17 @@ updates:
       interval: "daily"
     open-pull-requests-limit: 99
     groups:
-      # wasmtime and the wasm-tools crates ship as one upstream release train:
-      # wasmtime 48 pairs with the 0.257 wit-*/wasmparser line. Bumping them in
-      # separate PRs strands each one until the others merge, and lets the lock
-      # file accumulate several wasmparser versions at once.
+      # wasmtime and the wasm-tools crates ship as one upstream release train.
+      # Bumping them in separate PRs strands each one until the others merge,
+      # and lets the lock file accumulate several wasmparser versions at once.
       #
-      # update-types is deliberately omitted, which means every type. These are
-      # 0.x crates, so a 0.255 -> 0.257 bump counts as major; listing the types
-      # explicitly did not group them in practice.
+      # update-types is omitted so every bump stays here, including Cargo
+      # majors. These are 0.x crates, so 0.258 -> 0.259 counts as major.
+      #
+      # The crates only arrive here because cargo-minor-patch excludes them.
+      # A patternless group scores 500 and a wildcard such as wit-* scores
+      # about 90, so the catch-all takes them, rejects the major, and opens
+      # an individual PR per crate.
       wasm-toolchain:
         applies-to: "version-updates"
         # Covers the whole train, including crates that are transitive today,
@@ -40,6 +43,19 @@ updates:
         update-types:
           - "minor"
           - "patch"
+        # Keep in sync with wasm-toolchain. Without this, that group's
+        # wildcard patterns lose the specificity contest to this patternless
+        # group, and the 0.x toolchain bumps fall out as individual PRs.
+        exclude-patterns:
+          - "wit-*"
+          - "wasmtime"
+          - "wasmtime-*"
+          - "wasmparser"
+          - "wasmprinter"
+          - "wasm-encoder"
+          - "wasm-compose"
+          - "wasm-metadata"
+          - "wast"
 
   # fuzz/ declares its own [workspace] with an independent lock file, which the
   # entry above does not cover. Left alone it drifts: before this was added the
