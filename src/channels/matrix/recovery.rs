@@ -101,12 +101,14 @@ fn classify_matrix_sdk_recovery_restore_failure(
             MatrixSdkError::ReplyError(_) => "reply-error",
             MatrixSdkError::PowerLevels(_) => "power-levels",
             MatrixSdkError::UnknownError(_) => "unknown-error",
+            MatrixSdkError::SignatureError(_) => "signature-error",
+            MatrixSdkError::Timeout => "timeout",
             _ => "future-non-exhaustive",
         }
     }
 
     match error {
-        MatrixSdkError::Http(_) | MatrixSdkError::OAuth(_) => {
+        MatrixSdkError::Http(_) | MatrixSdkError::OAuth(_) | MatrixSdkError::Timeout => {
             RecoveryRestoreFailureReason::TransportError
         }
         MatrixSdkError::ConcurrentRequestFailed => RecoveryRestoreFailureReason::ConcurrentRequest,
@@ -151,6 +153,10 @@ fn classify_matrix_sdk_recovery_restore_failure(
         | MatrixSdkError::ReplyError(_)
         | MatrixSdkError::PowerLevels(_)
         | MatrixSdkError::UnknownError(_) => RecoveryRestoreFailureReason::SdkInternal,
+        // Signing or verification failed on restored key material. Same
+        // operator action as a secret-storage signature mismatch: the
+        // recovery key did not produce keys the server will accept.
+        MatrixSdkError::SignatureError(_) => RecoveryRestoreFailureReason::WrongKey,
         _ => {
             debug_assert!(
                 false,
@@ -186,6 +192,14 @@ fn classify_secret_storage_restore_failure(
         SecretStorageError::Storage(error) => classify_crypto_store_recovery_failure(error),
         SecretStorageError::Verification(_) => RecoveryRestoreFailureReason::WrongKey,
         SecretStorageError::Decryption(_) => RecoveryRestoreFailureReason::WrongKey,
+        // The passphrase opened secret storage, but the backup key inside
+        // does not match the homeserver's current backup (or the backup
+        // key could not be loaded). The SDK treats both as "recreate the
+        // server backup", not as a mistyped recovery passphrase.
+        SecretStorageError::InconsistentBackupDecryptionKey
+        | SecretStorageError::MissingOrInvalidBackupDecryptionKey => {
+            RecoveryRestoreFailureReason::ServerNotConfigured
+        }
     }
 }
 
@@ -206,6 +220,10 @@ fn classify_crypto_store_recovery_failure(
         | CryptoStoreError::UnsupportedDatabaseVersion(_, _)
         | CryptoStoreError::Backend(_)
         | CryptoStoreError::InvalidLockGeneration(_) => RecoveryRestoreFailureReason::LocalStore,
+        // vodozemac rejected a room-key backup ciphertext (MAC, padding,
+        // or a non-contributory key). That is not a sqlite fault, so it
+        // must not steer the operator toward wiping the local store.
+        CryptoStoreError::Backup(_) => RecoveryRestoreFailureReason::SdkInternal,
     }
 }
 
@@ -291,9 +309,13 @@ pub(super) async fn maybe_bootstrap_cross_signing(
     // Mirrors the documented leak at `persist_matrix_session_blocking`
     // (~line 5921). Window is much narrower than the access_token leak
     // above (request lifetime vs client lifetime).
+    // ruma 0.17 replaced `UserIdOrLocalpart` with `UserIdentifier::Matrix`.
+    // The inner string is still a full user id or a localpart.
     let mut auth = matrix_sdk::ruma::api::client::uiaa::Password::new(
-        matrix_sdk::ruma::api::client::uiaa::UserIdentifier::UserIdOrLocalpart(
-            session.user_id.to_string(),
+        matrix_sdk::ruma::api::client::uiaa::UserIdentifier::Matrix(
+            matrix_sdk::ruma::api::client::uiaa::MatrixUserIdentifier::new(
+                session.user_id.to_string(),
+            ),
         ),
         password.to_string(),
     );
@@ -2433,6 +2455,18 @@ mod tests {
         assert_eq!(
             classify_recovery_restore_failure(&RecoveryError::SecretStorage(
                 SecretStorageError::MissingKeyInfo { key_id: None },
+            )),
+            RecoveryRestoreFailureReason::ServerNotConfigured
+        );
+        assert_eq!(
+            classify_recovery_restore_failure(&RecoveryError::SecretStorage(
+                SecretStorageError::InconsistentBackupDecryptionKey,
+            )),
+            RecoveryRestoreFailureReason::ServerNotConfigured
+        );
+        assert_eq!(
+            classify_recovery_restore_failure(&RecoveryError::SecretStorage(
+                SecretStorageError::MissingOrInvalidBackupDecryptionKey,
             )),
             RecoveryRestoreFailureReason::ServerNotConfigured
         );

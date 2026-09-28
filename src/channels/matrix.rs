@@ -5193,7 +5193,9 @@ impl MatrixTextSendRoom for Room {
                 })
             })?;
         match send_result {
-            Ok(response) => Ok(response.event_id.to_string()),
+            // `Room::send` now returns the homeserver response beside
+            // encryption metadata. The event id lives on the response.
+            Ok(response) => Ok(response.response.event_id.to_string()),
             Err(err) => {
                 if let Some(terminal) = matrix_send_terminal_error(&err) {
                     return Err(MatrixTextSendFailure::Terminal(terminal));
@@ -5271,7 +5273,7 @@ fn matrix_room_message_content(
     // are tracing-warned and ignored rather than erroring the send,
     // so a single bad reply_to_id doesn't take the whole send path
     // down.
-    use matrix_sdk::ruma::events::relation::{InReplyTo, Thread};
+    use matrix_sdk::ruma::events::relation::{Reply, Thread};
     use matrix_sdk::ruma::events::room::message::Relation;
     use matrix_sdk::ruma::OwnedEventId;
     let mut content = RoomMessageEventContent::text_plain(text);
@@ -5326,9 +5328,8 @@ fn matrix_room_message_content(
         // the message at the top level.
         (Some(thread_root), None) => Some(Relation::Thread(Thread::without_fallback(thread_root))),
         // Reply only: plain rich-reply (no thread wrapping).
-        (None, Some(reply_event)) => Some(Relation::Reply {
-            in_reply_to: InReplyTo::new(reply_event),
-        }),
+        // `Relation::Reply` is a tuple around `Reply` as of ruma-events 0.35.
+        (None, Some(reply_event)) => Some(Relation::Reply(Reply::with_event_id(reply_event))),
         (None, None) => None,
     };
     content
@@ -6074,17 +6075,18 @@ fn is_invite_room_definitely_encrypted(room: &Room) -> bool {
     room.encryption_state().is_encrypted()
 }
 
-fn retry_after_from_kind(
-    kind: &matrix_sdk::ruma::api::client::error::ErrorKind,
-) -> Option<Duration> {
-    use matrix_sdk::ruma::api::client::error::{ErrorKind, RetryAfter};
+fn retry_after_from_kind(kind: &matrix_sdk::ruma::api::error::ErrorKind) -> Option<Duration> {
+    use matrix_sdk::ruma::api::error::{ErrorKind, RetryAfter};
+    // ruma 0.17 made `LimitExceeded` a tuple of `LimitExceededErrorData`.
+    // The retry hint still lives on that struct.
     match kind {
-        ErrorKind::LimitExceeded {
-            retry_after: Some(RetryAfter::Delay(delay)),
-        } => Some(*delay),
-        ErrorKind::LimitExceeded {
-            retry_after: Some(RetryAfter::DateTime(when)),
-        } => when.duration_since(std::time::SystemTime::now()).ok(),
+        ErrorKind::LimitExceeded(data) => match data.retry_after {
+            Some(RetryAfter::Delay(delay)) => Some(delay),
+            Some(RetryAfter::DateTime(when)) => {
+                when.duration_since(std::time::SystemTime::now()).ok()
+            }
+            None => None,
+        },
         _ => None,
     }
 }
@@ -6118,12 +6120,12 @@ fn matrix_retry_after_http(err: &matrix_sdk::HttpError) -> Option<Duration> {
 /// (operator banned, no power level, room policy). The two
 /// per-path classifiers handle Forbidden differently.
 fn classify_auth_terminal_kind(
-    kind: &matrix_sdk::ruma::api::client::error::ErrorKind,
+    kind: &matrix_sdk::ruma::api::error::ErrorKind,
     display: impl FnOnce() -> String,
 ) -> Option<MatrixError> {
-    use matrix_sdk::ruma::api::client::error::ErrorKind;
+    use matrix_sdk::ruma::api::error::ErrorKind;
     match kind {
-        ErrorKind::UnknownToken { .. }
+        ErrorKind::UnknownToken(_)
         | ErrorKind::UserDeactivated
         | ErrorKind::UserLocked
         | ErrorKind::UserSuspended => Some(MatrixError::AuthTokenRevoked(display())),
@@ -6132,7 +6134,7 @@ fn classify_auth_terminal_kind(
 }
 
 fn matrix_sync_terminal_error(err: &matrix_sdk::Error) -> Option<MatrixError> {
-    use matrix_sdk::ruma::api::client::error::ErrorKind;
+    use matrix_sdk::ruma::api::error::ErrorKind;
     if let Some(kind) = err.client_api_error_kind() {
         if let Some(terminal) = classify_auth_terminal_kind(kind, || err.to_string()) {
             return Some(terminal);
@@ -6140,7 +6142,7 @@ fn matrix_sync_terminal_error(err: &matrix_sdk::Error) -> Option<MatrixError> {
         // Sync-level M_FORBIDDEN means the token is no longer
         // authorized to sync — token-level concern, route to
         // AuthTokenRevoked so operator hint surfaces re-mint guidance.
-        if matches!(kind, ErrorKind::Forbidden { .. }) {
+        if matches!(kind, ErrorKind::Forbidden) {
             return Some(MatrixError::AuthTokenRevoked(err.to_string()));
         }
     }
@@ -6176,12 +6178,12 @@ fn matrix_sync_terminal_error(err: &matrix_sdk::Error) -> Option<MatrixError> {
 /// (or in `classify_auth_terminal_kind`, which the auth pipeline
 /// consults first).
 fn classify_auth_transient_kind(
-    kind: &matrix_sdk::ruma::api::client::error::ErrorKind,
+    kind: &matrix_sdk::ruma::api::error::ErrorKind,
     display: impl FnOnce() -> String,
 ) -> Option<MatrixError> {
-    use matrix_sdk::ruma::api::client::error::ErrorKind;
+    use matrix_sdk::ruma::api::error::ErrorKind;
     match kind {
-        ErrorKind::LimitExceeded { .. } => Some(MatrixError::AuthProbe(display())),
+        ErrorKind::LimitExceeded(_) => Some(MatrixError::AuthProbe(display())),
         _ => None,
     }
 }
@@ -6258,7 +6260,7 @@ fn matrix_sync_join_error(join_err: tokio::task::JoinError) -> MatrixError {
 /// the specific room rejected the send (not a token problem),
 /// so it routes to `SendTerminal` rather than `AuthTokenRevoked`.
 fn matrix_send_terminal_error(err: &matrix_sdk::Error) -> Option<MatrixError> {
-    use matrix_sdk::ruma::api::client::error::ErrorKind;
+    use matrix_sdk::ruma::api::error::ErrorKind;
     let kind = err.client_api_error_kind()?;
     if let Some(terminal) = classify_auth_terminal_kind(kind, || err.to_string()) {
         return Some(terminal);
@@ -6266,7 +6268,7 @@ fn matrix_send_terminal_error(err: &matrix_sdk::Error) -> Option<MatrixError> {
     match kind {
         // Room-level M_FORBIDDEN: per-room permission failure
         // (banned, no power level, room policy). Not a token issue.
-        ErrorKind::Forbidden { .. }
+        ErrorKind::Forbidden
         | ErrorKind::ThreepidDenied
         | ErrorKind::TooLarge
         | ErrorKind::GuestAccessForbidden
@@ -6284,12 +6286,12 @@ fn matrix_send_terminal_error(err: &matrix_sdk::Error) -> Option<MatrixError> {
 /// reflects token-state (the call was authenticated against the
 /// homeserver and refused), so it routes to AuthTokenRevoked.
 fn matrix_http_terminal_error(err: &matrix_sdk::HttpError) -> Option<MatrixError> {
-    use matrix_sdk::ruma::api::client::error::ErrorKind;
+    use matrix_sdk::ruma::api::error::ErrorKind;
     let kind = err.client_api_error_kind()?;
     if let Some(terminal) = classify_auth_terminal_kind(kind, || err.to_string()) {
         return Some(terminal);
     }
-    if matches!(kind, ErrorKind::Forbidden { .. }) {
+    if matches!(kind, ErrorKind::Forbidden) {
         return Some(MatrixError::AuthTokenRevoked(err.to_string()));
     }
     None
@@ -7197,12 +7199,9 @@ mod tests {
         // No relation: not suppressed.
         assert_eq!(matrix_relation_suppression_reason(None), None);
 
-        // The Thread/InReplyTo inner structs are not publicly
-        // constructible, so build relations via JSON deserialization
-        // through `RoomMessageEventContent`. The helper itself only
-        // needs to discriminate the outer Relation variant, so the
-        // exact inner-field shape doesn't matter beyond what serde
-        // needs.
+        // Feed deserialized relation shapes into the helper. `m.replace`
+        // keeps `m.new_content` next to `m.relates_to`, and the helper
+        // must still report that variant as a replacement.
         let edit: RoomMessageEventContent = serde_json::from_value(serde_json::json!({
             "msgtype": "m.text",
             "body": "* edited",
@@ -8695,14 +8694,14 @@ mod tests {
     /// caller can defer to retry logic.
     #[test]
     fn test_matrix_http_terminal_error_classifies_terminal_kinds() {
-        use matrix_sdk::ruma::api::client::error::ErrorKind;
+        use matrix_sdk::ruma::api::error::ErrorKind;
 
         // Account-state classifier handles only unambiguous kinds.
         // Forbidden is path-context-dependent: HTTP-layer (whoami,
         // token validation) treats it as token revocation; send-
         // path treats it as room-level rejection.
         for kind in [
-            ErrorKind::UnknownToken { soft_logout: false },
+            ErrorKind::UnknownToken(matrix_sdk::ruma::api::error::UnknownTokenErrorData::new()),
             ErrorKind::UserDeactivated,
             ErrorKind::UserLocked,
             ErrorKind::UserSuspended,
@@ -8715,13 +8714,16 @@ mod tests {
         // Forbidden is NOT in the account-state classifier; per-path
         // wrappers handle it.
         assert!(
-            classify_auth_terminal_kind(&ErrorKind::forbidden(), || "f".to_string()).is_none(),
+            classify_auth_terminal_kind(&ErrorKind::Forbidden, || "f".to_string()).is_none(),
             "Forbidden is path-context-dependent, not in account-state classifier"
         );
         assert!(
-            classify_auth_terminal_kind(&ErrorKind::LimitExceeded { retry_after: None }, || {
-                "transient".to_string()
-            })
+            classify_auth_terminal_kind(
+                &ErrorKind::LimitExceeded(
+                    matrix_sdk::ruma::api::error::LimitExceededErrorData::new()
+                ),
+                || { "transient".to_string() }
+            )
             .is_none(),
             "rate-limit errors remain transient"
         );
@@ -8734,11 +8736,13 @@ mod tests {
     /// backoff window instead of burning the local budget.
     #[test]
     fn test_retry_after_from_kind_extracts_limit_exceeded_delay() {
-        use matrix_sdk::ruma::api::client::error::{ErrorKind, RetryAfter};
+        use matrix_sdk::ruma::api::error::{ErrorKind, RetryAfter};
 
-        let kind = ErrorKind::LimitExceeded {
-            retry_after: Some(RetryAfter::Delay(Duration::from_secs(42))),
-        };
+        let kind = ErrorKind::LimitExceeded({
+            let mut data = matrix_sdk::ruma::api::error::LimitExceededErrorData::new();
+            data.retry_after = Some(RetryAfter::Delay(Duration::from_secs(42)));
+            data
+        });
         let extracted = retry_after_from_kind(&kind)
             .expect("LimitExceeded with Delay must surface a Retry-After");
         assert_eq!(extracted, Duration::from_secs(42));
@@ -8746,11 +8750,12 @@ mod tests {
 
     #[test]
     fn test_retry_after_from_kind_returns_none_for_missing_hint() {
-        use matrix_sdk::ruma::api::client::error::ErrorKind;
+        use matrix_sdk::ruma::api::error::ErrorKind;
 
-        let kind = ErrorKind::LimitExceeded { retry_after: None };
+        let kind =
+            ErrorKind::LimitExceeded(matrix_sdk::ruma::api::error::LimitExceededErrorData::new());
         assert!(retry_after_from_kind(&kind).is_none());
-        assert!(retry_after_from_kind(&ErrorKind::forbidden()).is_none());
+        assert!(retry_after_from_kind(&ErrorKind::Forbidden).is_none());
     }
 
     /// `LimitExceeded` (M_LIMIT_EXCEEDED, rate-limited login) must
@@ -8762,13 +8767,13 @@ mod tests {
     /// homeserver's rate-limit window."
     #[test]
     fn test_classify_auth_transient_kind_routes_limit_exceeded_to_retryable() {
-        use matrix_sdk::ruma::api::client::error::ErrorKind;
+        use matrix_sdk::ruma::api::error::ErrorKind;
 
-        let mapped =
-            classify_auth_transient_kind(&ErrorKind::LimitExceeded { retry_after: None }, || {
-                "rate-limited".to_string()
-            })
-            .expect("rate-limit must classify as transient");
+        let mapped = classify_auth_transient_kind(
+            &ErrorKind::LimitExceeded(matrix_sdk::ruma::api::error::LimitExceededErrorData::new()),
+            || "rate-limited".to_string(),
+        )
+        .expect("rate-limit must classify as transient");
         match mapped {
             MatrixError::AuthProbe(message) => assert_eq!(message, "rate-limited"),
             other => panic!("expected AuthProbe for LimitExceeded, got {other:?}"),
@@ -8778,7 +8783,7 @@ mod tests {
         // must NOT also be claimed by the transient classifier — the
         // two helpers partition the kind space without overlap.
         let terminal_kinds = [
-            ErrorKind::UnknownToken { soft_logout: false },
+            ErrorKind::UnknownToken(matrix_sdk::ruma::api::error::UnknownTokenErrorData::new()),
             ErrorKind::UserDeactivated,
             ErrorKind::UserLocked,
             ErrorKind::UserSuspended,
@@ -8795,7 +8800,7 @@ mod tests {
         // fall through to MatrixError::Auth) rather than being
         // silently auto-retried.
         assert!(
-            classify_auth_transient_kind(&ErrorKind::forbidden(), || "f".to_string()).is_none(),
+            classify_auth_transient_kind(&ErrorKind::Forbidden, || "f".to_string()).is_none(),
             "Forbidden must not be classified as transient at the auth layer"
         );
     }
@@ -9041,14 +9046,14 @@ mod tests {
     /// the function body has not been edited away from this shape.
     #[test]
     fn test_matrix_send_terminal_error_kind_routing_table() {
-        use matrix_sdk::ruma::api::client::error::ErrorKind;
+        use matrix_sdk::ruma::api::error::ErrorKind;
 
         // Account-state class — peeled by classify_auth_terminal_kind.
         // Forbidden is NOT here: at the send level it means the
         // specific room rejected the send (room-level permission
         // failure), not a token problem.
         for kind in [
-            ErrorKind::UnknownToken { soft_logout: false },
+            ErrorKind::UnknownToken(matrix_sdk::ruma::api::error::UnknownTokenErrorData::new()),
             ErrorKind::UserDeactivated,
             ErrorKind::UserLocked,
             ErrorKind::UserSuspended,
@@ -9063,7 +9068,7 @@ mod tests {
         // Forbidden bypasses the auth-state classifier; the
         // send-path wrapper handles it specifically.
         assert!(
-            classify_auth_terminal_kind(&ErrorKind::forbidden(), || "x".to_string()).is_none(),
+            classify_auth_terminal_kind(&ErrorKind::Forbidden, || "x".to_string()).is_none(),
             "Forbidden must NOT be in the auth-state classifier; \
              it is path-context-dependent"
         );
@@ -9074,7 +9079,7 @@ mod tests {
         // routing trips the test. Forbidden is in the send-terminal
         // table now.
         let send_terminal_kinds = [
-            ErrorKind::forbidden(),
+            ErrorKind::Forbidden,
             ErrorKind::ThreepidDenied,
             ErrorKind::TooLarge,
             ErrorKind::GuestAccessForbidden,
@@ -9089,7 +9094,7 @@ mod tests {
             // The send-class is matched in the wrapper's body:
             let send_classified = matches!(
                 kind,
-                ErrorKind::Forbidden { .. }
+                ErrorKind::Forbidden
                     | ErrorKind::ThreepidDenied
                     | ErrorKind::TooLarge
                     | ErrorKind::GuestAccessForbidden
@@ -9103,7 +9108,9 @@ mod tests {
         }
 
         // Transient class — neither classifier returns Some.
-        let transient_kinds = [ErrorKind::LimitExceeded { retry_after: None }];
+        let transient_kinds = [ErrorKind::LimitExceeded(
+            matrix_sdk::ruma::api::error::LimitExceededErrorData::new(),
+        )];
         for kind in transient_kinds {
             assert!(
                 classify_auth_terminal_kind(&kind, || "x".to_string()).is_none(),
@@ -9232,8 +9239,9 @@ mod tests {
         let body = matrix_rs_fn_body("fn matrix_send_terminal_error");
         let body = body.as_str();
         assert!(
-            body.contains("ErrorKind::Forbidden { .. }"),
-            "matrix_send_terminal_error must explicitly handle Forbidden"
+            body.contains("ErrorKind::Forbidden\n        | ErrorKind::ThreepidDenied"),
+            "matrix_send_terminal_error must match Forbidden as its own arm \
+             ahead of the other send-terminal kinds"
         );
         assert!(
             body.contains("MatrixError::SendTerminal"),
@@ -10382,10 +10390,10 @@ mod tests {
 
         let reply_only =
             matrix_room_message_content("hello".to_string(), Some("$reply:example.com"), None);
-        let Some(Relation::Reply { in_reply_to }) = reply_only.relates_to.as_ref() else {
+        let Some(Relation::Reply(reply)) = reply_only.relates_to.as_ref() else {
             panic!("reply-only send context must produce a Matrix reply relation");
         };
-        assert_eq!(in_reply_to.event_id.as_str(), "$reply:example.com");
+        assert_eq!(reply.in_reply_to.event_id.as_str(), "$reply:example.com");
     }
 
     #[test]
@@ -10422,11 +10430,10 @@ mod tests {
             Some("$reply:example.com"),
             Some("not-an-event-id"),
         );
-        let Some(Relation::Reply { in_reply_to }) = invalid_thread_valid_reply.relates_to.as_ref()
-        else {
+        let Some(Relation::Reply(reply)) = invalid_thread_valid_reply.relates_to.as_ref() else {
             panic!("valid reply_to_id must survive an invalid thread_id");
         };
-        assert_eq!(in_reply_to.event_id.as_str(), "$reply:example.com");
+        assert_eq!(reply.in_reply_to.event_id.as_str(), "$reply:example.com");
     }
 
     #[tokio::test(flavor = "current_thread")]

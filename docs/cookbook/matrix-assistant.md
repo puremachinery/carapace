@@ -18,8 +18,8 @@ the matrix-sdk.
   device, for SAS verification of Carapace's device.
 
 Matrix support is opt-in via `matrix.enabled: true`. Carapace pins
-`matrix-sdk` 0.14.x with `default-features = false` and the
-`e2e-encryption`, `sqlite`, and `rustls-tls` features.
+`matrix-sdk` 0.19.1 with `default-features = false` and the
+`e2e-encryption`, `sqlite`, and `rustls-aws-lc-rs` features.
 
 ## 1) Create config
 
