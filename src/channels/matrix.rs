@@ -7199,12 +7199,9 @@ mod tests {
         // No relation: not suppressed.
         assert_eq!(matrix_relation_suppression_reason(None), None);
 
-        // The Thread/InReplyTo inner structs are not publicly
-        // constructible, so build relations via JSON deserialization
-        // through `RoomMessageEventContent`. The helper itself only
-        // needs to discriminate the outer Relation variant, so the
-        // exact inner-field shape doesn't matter beyond what serde
-        // needs.
+        // Feed deserialized relation shapes into the helper. `m.replace`
+        // keeps `m.new_content` next to `m.relates_to`, and the helper
+        // must still report that variant as a replacement.
         let edit: RoomMessageEventContent = serde_json::from_value(serde_json::json!({
             "msgtype": "m.text",
             "body": "* edited",
@@ -9242,8 +9239,9 @@ mod tests {
         let body = matrix_rs_fn_body("fn matrix_send_terminal_error");
         let body = body.as_str();
         assert!(
-            body.contains("ErrorKind::Forbidden"),
-            "matrix_send_terminal_error must explicitly handle Forbidden"
+            body.contains("ErrorKind::Forbidden\n        | ErrorKind::ThreepidDenied"),
+            "matrix_send_terminal_error must match Forbidden as its own arm \
+             ahead of the other send-terminal kinds"
         );
         assert!(
             body.contains("MatrixError::SendTerminal"),
