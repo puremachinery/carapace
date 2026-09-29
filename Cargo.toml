@@ -84,7 +84,7 @@ unicode-normalization = "0.1"
 sigstore-trust-root = { version = "0.6.6", git = "https://github.com/puremachinery/sigstore-rust", rev = "8e86cf3c4edf96ba9e87c7cb47764e6b78f5382a", features = ["tuf"] }
 sigstore-types = { version = "0.6.6", git = "https://github.com/puremachinery/sigstore-rust", rev = "8e86cf3c4edf96ba9e87c7cb47764e6b78f5382a" }
 sigstore-verify = { version = "0.6.6", git = "https://github.com/puremachinery/sigstore-rust", rev = "8e86cf3c4edf96ba9e87c7cb47764e6b78f5382a" }
-matrix-sdk = { version = "0.16.1", default-features = false, features = ["e2e-encryption", "sqlite", "rustls-tls"] }
+matrix-sdk = { version = "0.19.1", default-features = false, features = ["e2e-encryption", "sqlite", "rustls-aws-lc-rs"] }
 # CLI store-rekey code reads and writes serialized StoreCipher export
 # blobs directly. Keep the direct dependency patched independently of
 # matrix-sdk's internal version, with cross-version wire tests covering
@@ -95,12 +95,13 @@ matrix-sdk-store-encryption = "0.18.0"
 # source (so MSVC builds don't need `sqlite3.lib` from the system).
 # On Unix the system-libsqlite path is preferred — `bundled` would
 # recompile the ~220 KB sqlite amalgamation on every Linux/macOS build
-# unnecessarily. matrix-sdk-sqlite uses its own libsqlite3-sys entry
-# in either case.
-rusqlite = "0.37.0"
+# unnecessarily. This pin must stay on the same rusqlite line as
+# matrix-sdk-sqlite: both pull libsqlite3-sys, and Cargo allows only
+# one package to link the native sqlite3 library.
+rusqlite = "0.40.2"
 
 [target.'cfg(windows)'.dependencies]
-rusqlite = { version = "0.37.0", features = ["bundled"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 win32job = "2.0.3"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Threading"] }
 rappct = "0.13.3"
@@ -118,6 +119,9 @@ tower = { version = "0.5", features = ["util"] }
 wit-component = { version = "0.258.0", features = ["dummy-module"] }
 wit-parser = "0.258.0"
 matrix-sdk-store-encryption-016 = { package = "matrix-sdk-store-encryption", version = "0.16.1" }
+# The SDK writes store-cipher blobs with its own store-encryption crate.
+# The CLI rekey path imports those blobs through the direct 0.18 dependency.
+matrix-sdk-store-encryption-019 = { package = "matrix-sdk-store-encryption", version = "0.19.1" }
 
 [features]
 gateway = []

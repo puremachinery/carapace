@@ -12,7 +12,7 @@ with open("Cargo.toml", "rb") as fh:
     manifest = tomllib.load(fh)
 
 dep = manifest.get("dependencies", {}).get("matrix-sdk")
-required = {"e2e-encryption", "sqlite", "rustls-tls"}
+required = {"e2e-encryption", "sqlite", "rustls-aws-lc-rs"}
 if not isinstance(dep, dict):
     sys.exit(1)
 features = set(dep.get("features", []))
@@ -24,7 +24,7 @@ PY
 then
   cat >&2 <<'EOF'
 matrix-sdk feature contract changed.
-Expected default-features = false with features containing ["e2e-encryption", "sqlite", "rustls-tls"].
+Expected default-features = false with features containing ["e2e-encryption", "sqlite", "rustls-aws-lc-rs"].
 Matrix must stay on rustls and must not enable native-tls, openssl-tls, or bundled SQLite features implicitly.
 EOF
   exit 1

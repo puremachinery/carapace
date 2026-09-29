@@ -217,11 +217,10 @@ Matrix support is a native stateful channel, not a webhook adapter. Carapace
 owns the Matrix SDK client, login/session restore, sync loop, invite decisions,
 device verification state, encrypted SQLite store, and outbound queue.
 
-This implementation is pinned to `matrix-sdk` 0.14.x with
-`default-features = false` and `e2e-encryption`, `sqlite`, and `rustls-tls`.
-The current 0.16.x SDK line was checked during this work but overflows the
-current Rust compiler query-depth limit while compiling `matrix-sdk`; revisit
-the pin when the SDK or toolchain resolves that compiler failure.
+This implementation pins `matrix-sdk` 0.19.1 with `default-features = false`
+and `e2e-encryption`, `sqlite`, and `rustls-aws-lc-rs`. Keep the direct
+`rusqlite` pin on the same release line as `matrix-sdk-sqlite` so the
+binary links one `libsqlite3-sys`.
 
 **TLS-backend policy.** The Matrix dependency graph stays on rustls. CI
 enforces this via the "Matrix OpenSSL Guard" job, which fails the build
@@ -620,7 +619,7 @@ Daemon startup wraps each SDK HTTP call in a 30-second
 `RequestConfig::short_retry().timeout(...)` (see `MATRIX_RUNTIME_OPERATION_TIMEOUT`).
 A wedged TLS handshake on the homeserver therefore bounds startup
 to roughly `30s × short_retry_budget` (≈90s for the default 3-attempt
-budget — `retry_limit=3` in matrix-sdk 0.14.0 yields 3 total attempts,
+budget — `retry_limit=3` in matrix-sdk 0.19.1 yields 3 total attempts,
 not 4) rather than hanging forever. If `cara verify --outcome matrix`
 reports `auth-probe` or a generic runtime-init timeout AND the
 homeserver is reachable via `curl https://<homeserver>/_matrix/client/versions`

@@ -19384,6 +19384,18 @@ mod tests {
             .expect("export direct-version cipher");
         SdkStoreCipher::import(passphrase, &direct_blob)
             .expect("SDK-version store-encryption must import direct cipher blobs after rekey");
+
+        // matrix-sdk 0.19.1 writes passphrase blobs with store-encryption
+        // 0.19.1. The CLI still imports them with the direct 0.18 crate.
+        use matrix_sdk_store_encryption_019::StoreCipher as Sdk019StoreCipher;
+        let sdk_019 = Sdk019StoreCipher::new().expect("new 0.19.1 cipher");
+        let sdk_019_blob = sdk_019
+            ._insecure_export_fast_for_testing(passphrase)
+            .expect("export 0.19.1 cipher");
+        DirectStoreCipher::import(passphrase, &sdk_019_blob)
+            .expect("CLI store-encryption 0.18 must import blobs the 0.19.1 SDK writes");
+        Sdk019StoreCipher::import(passphrase, &direct_blob)
+            .expect("SDK 0.19.1 must import blobs the CLI rekey path writes");
     }
 
     /// Detection-time error before any UPDATE means the operator can
