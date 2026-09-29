@@ -119,9 +119,10 @@ tower = { version = "0.5", features = ["util"] }
 wit-component = { version = "0.259.0", features = ["dummy-module"] }
 wit-parser = "0.259.0"
 matrix-sdk-store-encryption-016 = { package = "matrix-sdk-store-encryption", version = "0.16.1" }
-# The SDK writes store-cipher blobs with its own store-encryption crate.
-# The CLI rekey path imports those blobs through the direct 0.18 dependency.
-matrix-sdk-store-encryption-019 = { package = "matrix-sdk-store-encryption", version = "0.19.1" }
+# Cargo rejects two dependencies on one version under different names, so
+# 0.19.1 lives only on the direct dependency above. This alias keeps the
+# wire test able to import blobs written by the previous 0.18.0 pin.
+matrix-sdk-store-encryption-018 = { package = "matrix-sdk-store-encryption", version = "0.18.0" }
 
 [features]
 gateway = []

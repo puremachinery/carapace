@@ -618,6 +618,7 @@ dependencies = [
  "mach2 0.7.0",
  "matrix-sdk",
  "matrix-sdk-store-encryption 0.16.1",
+ "matrix-sdk-store-encryption 0.18.0",
  "matrix-sdk-store-encryption 0.19.1",
  "mdns-sd",
  "notify",
@@ -3305,6 +3306,26 @@ dependencies = [
  "hmac 0.12.1",
  "pbkdf2 0.12.2",
  "rand 0.8.6",
+ "rmp-serde",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.21",
+ "zeroize",
+]
+
+[[package]]
+name = "matrix-sdk-store-encryption"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f48f304e553fb6200b1d7d1f77a88fd182076d4b25624e9dbfa42d6a37de35e"
+dependencies = [
+ "base64 0.22.1",
+ "blake3",
+ "chacha20poly1305 0.10.1",
+ "hmac 0.12.1",
+ "pbkdf2 0.12.2",
+ "rand 0.10.3",
  "rmp-serde",
  "serde",
  "serde_json",

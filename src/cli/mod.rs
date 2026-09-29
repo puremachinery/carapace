@@ -19341,9 +19341,9 @@ mod tests {
 
     /// The Matrix SDK owns the SQLite store at runtime, while the
     /// `rekey-store` CLI path directly imports/exports the serialized
-    /// `StoreCipher` blob. The direct dependency can be newer than the
-    /// SDK's internal store-encryption crate, but the blob wire format
-    /// must stay interoperable in both directions.
+    /// `StoreCipher` blob. The direct pin matches the SDK's
+    /// store-encryption crate. Blobs written by 0.16.1 and by the
+    /// previous 0.18.0 pin must still import in both directions.
     #[test]
     fn test_matrix_store_cipher_direct_dependency_matches_sdk_wire_format() {
         use matrix_sdk_store_encryption::StoreCipher as DirectStoreCipher;
@@ -19385,17 +19385,17 @@ mod tests {
         SdkStoreCipher::import(passphrase, &direct_blob)
             .expect("SDK-version store-encryption must import direct cipher blobs after rekey");
 
-        // matrix-sdk 0.19.1 writes passphrase blobs with store-encryption
-        // 0.19.1. The CLI still imports them with the direct 0.18 crate.
-        use matrix_sdk_store_encryption_019::StoreCipher as Sdk019StoreCipher;
-        let sdk_019 = Sdk019StoreCipher::new().expect("new 0.19.1 cipher");
-        let sdk_019_blob = sdk_019
+        // Stores written before this pin used store-encryption 0.18.0.
+        // The CLI now writes 0.19.1 blobs. Both directions must import.
+        use matrix_sdk_store_encryption_018::StoreCipher as PreviousStoreCipher;
+        let previous = PreviousStoreCipher::new().expect("new 0.18 cipher");
+        let previous_blob = previous
             ._insecure_export_fast_for_testing(passphrase)
-            .expect("export 0.19.1 cipher");
-        DirectStoreCipher::import(passphrase, &sdk_019_blob)
-            .expect("CLI store-encryption 0.18 must import blobs the 0.19.1 SDK writes");
-        Sdk019StoreCipher::import(passphrase, &direct_blob)
-            .expect("SDK 0.19.1 must import blobs the CLI rekey path writes");
+            .expect("export 0.18 cipher");
+        DirectStoreCipher::import(passphrase, &previous_blob)
+            .expect("CLI store-encryption 0.19.1 must import blobs written by 0.18");
+        PreviousStoreCipher::import(passphrase, &direct_blob)
+            .expect("0.18 store-encryption must import blobs the 0.19.1 CLI writes");
     }
 
     /// Detection-time error before any UPDATE means the operator can
