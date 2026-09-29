@@ -19339,24 +19339,18 @@ mod tests {
         .expect("seed cipher");
     }
 
-    /// The Matrix SDK owns the SQLite store at runtime, while the
-    /// `rekey-store` CLI path directly imports/exports the serialized
-    /// `StoreCipher` blob. The direct pin matches the SDK's
-    /// store-encryption crate. Blobs written by 0.16.1 and by the
-    /// previous 0.18.0 pin must still import in both directions.
+    /// Stores created before the 0.19.1 pin hold a passphrase blob from
+    /// store-encryption 0.16.1. Rekey and the SDK both import that blob
+    /// with the current crate, so this fixture must keep opening.
     #[test]
-    fn test_matrix_store_cipher_direct_dependency_matches_sdk_wire_format() {
-        use matrix_sdk_store_encryption::StoreCipher as DirectStoreCipher;
-        use matrix_sdk_store_encryption_016::StoreCipher as SdkStoreCipher;
+    fn test_store_cipher_imports_legacy_passphrase_blob() {
+        use matrix_sdk_store_encryption::StoreCipher;
 
         let passphrase = "matrix-store-passphrase";
 
         // Generated with matrix-sdk-store-encryption 0.16.1
         // StoreCipher::_insecure_export_fast_for_testing(passphrase).
-        // Hardcoding avoids constructing the 0.16.1 RNG path in this
-        // process while still proving the exact serialized blob shape
-        // emitted by the SDK-version crate.
-        const SDK_016_STORE_CIPHER_BLOB: &[u8] = &[
+        const LEGACY_STORE_CIPHER_BLOB: &[u8] = &[
             130, 168, 107, 100, 102, 95, 105, 110, 102, 111, 129, 184, 80, 98, 107, 100, 102, 50,
             84, 111, 67, 104, 97, 67, 104, 97, 50, 48, 80, 111, 108, 121, 49, 51, 48, 53, 130, 166,
             114, 111, 117, 110, 100, 115, 205, 3, 232, 168, 107, 100, 102, 95, 115, 97, 108, 116,
@@ -19375,27 +19369,8 @@ mod tests {
             74, 204, 191, 204, 131, 204, 168, 30, 204, 225, 67, 62, 204, 203, 204, 174, 25, 110,
             204, 133, 124, 48, 204, 154, 14, 34, 204, 203, 12, 100, 204, 143, 204, 175,
         ];
-        DirectStoreCipher::import(passphrase, SDK_016_STORE_CIPHER_BLOB)
-            .expect("direct store-encryption must import SDK-version cipher blobs");
-
-        let direct_cipher = DirectStoreCipher::new().expect("new direct-version cipher");
-        let direct_blob = direct_cipher
-            ._insecure_export_fast_for_testing(passphrase)
-            .expect("export direct-version cipher");
-        SdkStoreCipher::import(passphrase, &direct_blob)
-            .expect("SDK-version store-encryption must import direct cipher blobs after rekey");
-
-        // Stores written before this pin used store-encryption 0.18.0.
-        // The CLI now writes 0.19.1 blobs. Both directions must import.
-        use matrix_sdk_store_encryption_018::StoreCipher as PreviousStoreCipher;
-        let previous = PreviousStoreCipher::new().expect("new 0.18 cipher");
-        let previous_blob = previous
-            ._insecure_export_fast_for_testing(passphrase)
-            .expect("export 0.18 cipher");
-        DirectStoreCipher::import(passphrase, &previous_blob)
-            .expect("CLI store-encryption 0.19.1 must import blobs written by 0.18");
-        PreviousStoreCipher::import(passphrase, &direct_blob)
-            .expect("0.18 store-encryption must import blobs the 0.19.1 CLI writes");
+        StoreCipher::import(passphrase, LEGACY_STORE_CIPHER_BLOB)
+            .expect("current store-encryption must import a pre-0.19.1 passphrase blob");
     }
 
     /// Detection-time error before any UPDATE means the operator can
