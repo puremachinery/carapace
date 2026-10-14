@@ -11,7 +11,9 @@ pub(crate) fn tool_plugin_component_bytes() -> Vec<u8> {
         .select_world(&[pkg], Some("tool-plugin"))
         .expect("select tool-plugin world");
     let mut module = dummy_module(&resolve, world, ManglingAndAbi::Standard32);
-    embed_component_metadata(&mut module, &resolve, world, StringEncoding::UTF8)
+    // `ComponentEncoder::default()` leaves canonical interface names off.
+    // The embedded component-type section has to use that same naming.
+    embed_component_metadata(&mut module, &resolve, world, StringEncoding::UTF8, false)
         .expect("embed component metadata");
     ComponentEncoder::default()
         .module(&module)
