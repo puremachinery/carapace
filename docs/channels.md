@@ -15,8 +15,8 @@ service HTTP port 18789. Adjust paths/ports for your deployment.
 ## Common Notes
 
 - Webhook-based inbound modes require a public HTTPS URL (for example, Telegram
-  webhook mode and Slack Events API). Polling/Gateway modes (Signal polling,
-  Telegram polling fallback, Discord Gateway) do not require a public webhook
+  webhook mode and Slack Events API). Inbound streaming and polling modes (Signal WebSocket
+  stream, Telegram polling fallback, Discord Gateway) do not require a public webhook
   endpoint.
 - If you are behind a reverse proxy, ensure it forwards to Carapace and
   preserves the request body.
@@ -55,15 +55,22 @@ error output.
 
 ## Signal (signal-cli-rest-api)
 
-Signal uses a polling loop against the local `signal-cli-rest-api` container.
-Inbound messages are delivered by polling `GET /v1/receive/{number}`.
+Signal connects to the local `signal-cli-rest-api` container via a WebSocket stream
+in JSON-RPC mode (`MODE=json-rpc-native` or `MODE=json-rpc`). Inbound messages are
+received in real time over `ws://{base_url}/v1/receive/{number}` (or `wss://...`).
+
+> [!IMPORTANT]
+> Carapace requires `signal-cli-rest-api` to run in JSON-RPC mode (`MODE=json-rpc-native`
+> or `MODE=json-rpc`) to support real-time WebSocket receive streaming. `MODE=native`
+> and `MODE=normal` are not supported because they do not expose the WebSocket receive endpoint.
 
 1) Start signal-cli-rest-api:
 
 ```bash
 docker run -d -p 8080:8080 -v $HOME/.local/share/signal-api:/home/.local/share/signal-cli \
-  -e MODE=native bbernhard/signal-cli-rest-api
+  -e MODE=json-rpc-native bbernhard/signal-cli-rest-api
 ```
+*(or `-e MODE=json-rpc`)*
 
 2) Configure Carapace:
 
@@ -98,14 +105,14 @@ as the sender identifier in that case.
 When `channels.signal.features.typing.enabled` is true, Carapace refreshes the
 Signal typing indicator while the assistant is generating a reply and clears it
 before outbound delivery.
-When `channels.signal.features.readReceipts.enabled` is true, Carapace polls
-Signal with `send_read_receipts=false` and only sends a read receipt after the
-inbound message is durably appended to Carapace's session/history store. This
-happens before any LLM response is generated or delivered. If the append fails,
-Carapace leaves the message unread. Unsupported Signal messages that Carapace
-does not ingest today, including group messages and non-text messages, also
-remain unread while this feature is enabled. When the feature is disabled,
-Signal keeps its normal auto-read-receipt behavior.
+When `channels.signal.features.readReceipts.enabled` is true, Carapace connects
+to the Signal receive stream with `send_read_receipts=false` and only sends a read
+receipt after the inbound message is durably appended to Carapace's session/history
+store. This happens before any LLM response is generated or delivered. If the append
+fails, Carapace leaves the message unread. Unsupported Signal messages that Carapace
+does not ingest today, including group messages and non-text messages, also remain
+unread while this feature is enabled. When the feature is disabled, Signal keeps
+its normal auto-read-receipt behavior.
 
 ## Telegram (Bot API + Webhook or Polling)
 

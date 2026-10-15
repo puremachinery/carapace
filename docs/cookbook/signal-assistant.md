@@ -14,12 +14,15 @@ with typing indicators and explicit read receipts.
 
 ## 1) Start signal-cli-rest-api
 
+Start `signal-cli-rest-api` in JSON-RPC mode (`MODE=json-rpc-native` or `MODE=json-rpc`), which is required for Carapace's real-time WebSocket receive stream:
+
 ```bash
 docker run -d -p 8080:8080 \
   -v $HOME/.local/share/signal-api:/home/.local/share/signal-cli \
-  -e MODE=native \
+  -e MODE=json-rpc-native \
   bbernhard/signal-cli-rest-api
 ```
+*(or `-e MODE=json-rpc`)*
 
 Register or link your phone number via the signal-cli-rest-api
 [documentation](https://github.com/bbernhard/signal-cli-rest-api#getting-started).
@@ -114,10 +117,11 @@ For reproducible live checks, use [Channel Smoke Validation](../channel-smoke.md
 
 ## Common failures and fixes
 
-- Symptom: No inbound messages in logs.
-  - Fix: Confirm signal-cli-rest-api is running and reachable at the
-    configured `baseUrl`. Check that `phoneNumber` matches the registered
-    number.
+- Symptom: No inbound messages in logs or WebSocket connection errors.
+  - Fix: Confirm `signal-cli-rest-api` is running, reachable at the
+    configured `baseUrl`, and started with `MODE=json-rpc-native` or `MODE=json-rpc`
+    (required for the WebSocket receive stream). Check that `phoneNumber` matches
+    the registered number.
 - Symptom: `SSRF validation failed` error.
   - Fix: Use `http://localhost:8080` (loopback) or `https://` for
     non-loopback deployments. Carapace blocks non-HTTPS non-loopback URLs.

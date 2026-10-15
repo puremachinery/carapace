@@ -81,7 +81,7 @@ features:
     status: "verified_done"
     runtime_wiring:
       - "src/channels/signal.rs (SignalChannel send_text/send_media/start_typing/stop_typing/mark_read)"
-      - "src/channels/signal_receive.rs (signal-cli receive polling + inbound dispatch)"
+      - "src/channels/signal_receive.rs (signal-cli WebSocket receive stream + inbound dispatch)"
       - "src/main.rs (register_signal_channel_if_configured)"
       - "src/main.rs (spawn_signal_receive_loop_if_configured)"
     tests:
