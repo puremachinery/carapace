@@ -26,7 +26,38 @@ uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter", "time"] }
 keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "windows-native", "linux-native"] }
-wasmtime = { version = "49.0.2", features = ["component-model"] }
+# wasmtime's default `cache` feature links zstd 0.13. Releases 49 and 50
+# both require `zstd ^0.13`, and the patched crate is 0.14, so the cache
+# feature cannot be upgraded in place. Carapace does not use wasmtime's
+# on-disk compilation cache. The list below is wasmtime 49's default
+# feature set without `cache`.
+wasmtime = { version = "49.0.4", default-features = false, features = [
+    "anyhow",
+    "async",
+    "backtrace",
+    "gc",
+    "gc-copying",
+    "gc-drc",
+    "gc-null",
+    "wat",
+    "profiling",
+    "parallel-compilation",
+    "cranelift",
+    "pooling-allocator",
+    "demangle",
+    "addr2line",
+    "coredump",
+    "debug-builtins",
+    "runtime",
+    "component-model",
+    "component-model-async",
+    "threads",
+    "stack-switching",
+    "std",
+    "debug",
+    "compile-time-builtins",
+    "wit-parser",
+] }
 thiserror = "2"
 parking_lot = "0.12"
 base64 = "0.23"
