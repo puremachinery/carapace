@@ -31,7 +31,7 @@ keyring = { version = "3.6.3", default-features = false, features = ["apple-nati
 # feature cannot be upgraded in place. Carapace does not use wasmtime's
 # on-disk compilation cache. The list below is wasmtime 49's default
 # feature set without `cache`.
-wasmtime = { version = "49.0.4", default-features = false, features = [
+wasmtime = { version = "50.0.0", default-features = false, features = [
     "anyhow",
     "async",
     "backtrace",
