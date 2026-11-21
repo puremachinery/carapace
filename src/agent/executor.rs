@@ -1531,7 +1531,37 @@ pub async fn execute_run(
             .await
             .map_err(|e| AgentError::SessionStore(e.to_string()))?;
 
+            let budget = match config.max_cost_usd {
+                Some(cap) => Some(
+                    llm_budget::AgentBudget::builder(run_id.clone(), cap)
+                        .allow_stale_prices()
+                        .on_unsafe(|event| tracing::warn!("llm-budget: {event}"))
+                        .build()
+                        .map_err(|e| AgentError::Provider(e.to_string()))?,
+                ),
+                None => None,
+            };
+
+            let mut last_turn_input: u64 = 1;
+
             for _turn in 0..config.max_turns {
+                let hold = match &budget {
+                    Some(budget) => {
+                        let estimate =
+                            llm_budget::Usage::new(last_turn_input, u64::from(config.max_tokens));
+                        match budget.reserve_for(&config.model, &estimate) {
+                            Ok(hold) => Some(hold),
+                            Err(llm_budget::BudgetError::AgentExhausted { spent, .. }) => {
+                                tracing::warn!(run_id = %run_id, spent, "run stopped at maxCostUsd");
+                                break;
+                            }
+                            Err(e) => return Err(AgentError::Provider(e.to_string())),
+                        }
+                    }
+                    None => None,
+                };
+                let (input_before, output_before) = (total_input_tokens, total_output_tokens);
+
                 let should_continue = execute_single_turn(
                     &config,
                     &state,
@@ -1550,6 +1580,15 @@ pub async fn execute_run(
                     &mut final_stop_reason,
                 )
                 .await?;
+
+                last_turn_input = (total_input_tokens - input_before).max(1);
+                if let Some(hold) = hold {
+                    let used = llm_budget::Usage::new(
+                        total_input_tokens - input_before,
+                        total_output_tokens - output_before,
+                    );
+                    hold.settle_usage(&config.model, &used);
+                }
 
                 if !should_continue {
                     break;
@@ -2369,6 +2408,81 @@ mod tests {
         .await;
         // Should complete without error — the loop simply exits after max_turns
         assert!(result.is_ok(), "execute_run failed: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn test_max_cost_usd_stops_run() {
+        let (state, _tmp) = make_test_state_with_tools();
+        let run_id = "run-max-cost";
+        let session_key = "test-session-max-cost";
+        setup_session_and_run(&state, session_key, run_id);
+
+        // Each turn reads 100k input tokens: $0.25 on gpt-4o.
+        let turn = || {
+            vec![
+                StreamEvent::ToolUse {
+                    id: "tool_1".to_string(),
+                    name: "time".to_string(),
+                    input: serde_json::json!({}),
+                    metadata: None,
+                },
+                StreamEvent::Stop {
+                    reason: StopReason::ToolUse,
+                    usage: TokenUsage {
+                        input_tokens: 100_000,
+                        output_tokens: 1,
+                    },
+                },
+            ]
+        };
+        let provider = Arc::new(MockProvider::new((0..10).map(|_| turn()).collect()));
+        let config = AgentConfig {
+            model: "gpt-4o".to_string(),
+            max_turns: 10,
+            max_tokens: 1,
+            max_cost_usd: Some(0.30),
+            ..Default::default()
+        };
+
+        let result = execute_run(
+            run_id.to_string(),
+            session_key.to_string(),
+            config,
+            state.clone(),
+            provider.clone(),
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(result.is_ok(), "execute_run failed: {:?}", result.err());
+        // Turn 1 spends $0.25; turn 2 would need another $0.25 and is never sent.
+        assert_eq!(provider.responses.lock().len(), 9);
+    }
+
+    #[tokio::test]
+    async fn test_max_cost_usd_refuses_unpriced_model() {
+        let (state, _tmp) = make_test_state_with_tools();
+        let run_id = "run-max-cost-unpriced";
+        let session_key = "test-session-max-cost-unpriced";
+        setup_session_and_run(&state, session_key, run_id);
+
+        let provider = Arc::new(MockProvider::text("hi"));
+        let config = AgentConfig {
+            model: "no-such-model".to_string(),
+            max_cost_usd: Some(1.0),
+            ..Default::default()
+        };
+
+        let result = execute_run(
+            run_id.to_string(),
+            session_key.to_string(),
+            config,
+            state.clone(),
+            provider.clone(),
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(provider.responses.lock().len(), 1);
     }
 
     #[tokio::test]
