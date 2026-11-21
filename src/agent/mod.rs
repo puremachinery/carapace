@@ -201,6 +201,10 @@ pub struct AgentConfig {
     pub system: Option<String>,
     /// Maximum agentic turns (LLM round-trips). Default 25.
     pub max_turns: u32,
+    /// Hard USD cap for one run, priced per model by `llm-budget`. Each turn
+    /// reserves its worst case first and the run stops when it does not fit.
+    /// A model with no known price is refused while a cap is set. Default: none.
+    pub max_cost_usd: Option<f64>,
     /// Maximum output tokens per LLM call. Default 8192.
     pub max_tokens: u32,
     /// Sampling temperature. None means provider default.
@@ -237,6 +241,7 @@ impl Default for AgentConfig {
             model: String::new(),
             system: None,
             max_turns: 25,
+            max_cost_usd: None,
             max_tokens: 8192,
             temperature: None,
             deliver: false,
@@ -417,6 +422,12 @@ fn apply_agent_overrides(config: &mut AgentConfig, agent_obj: &serde_json::Map<S
     if let Some(max_turns) = agent_obj.get("maxTurns").and_then(|v| v.as_u64()) {
         if max_turns > 0 {
             config.max_turns = max_turns.min(u32::MAX as u64) as u32;
+        }
+    }
+
+    if let Some(max_cost) = agent_obj.get("maxCostUsd").and_then(|v| v.as_f64()) {
+        if max_cost > 0.0 && max_cost.is_finite() {
+            config.max_cost_usd = Some(max_cost);
         }
     }
 
